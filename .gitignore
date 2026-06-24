@@ -1,0 +1,23 @@
+# secrets — NEVER commit (treat this repo as public)
+.env
+secrets/
+*.secret.conf
+
+# rendered Asterisk config (contains creds / PII — only the .template is committed)
+asterisk/pjsip.conf
+asterisk/globals.conf
+
+# python
+agent/.venv/
+__pycache__/
+*.pyc
+
+# audio / call dumps
+*.wav
+*.raw
+*.slin
+recordings/
+
+# misc
+.DS_Store
+*.log

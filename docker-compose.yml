@@ -1,0 +1,24 @@
+# switchboard — portable stack (Linux-first).
+#
+# On macOS (e.g. the headless Mac) run Asterisk NATIVELY via scripts/mac-setup.sh —
+# SIP/RTP in Docker-for-Mac is painful — and run only the `agent` service (or the
+# native venv). RTP never crosses the container boundary: the agent only speaks
+# AudioSocket (TCP) to Asterisk on localhost:9000, which Docker-for-Mac handles fine.
+
+services:
+  asterisk:
+    # Linux hosts only. Host networking so SIP/RTP work without port-mapping hell.
+    build: ./asterisk
+    network_mode: host
+    volumes:
+      - ./asterisk:/etc/asterisk-template:ro   # entrypoint renders pjsip.conf/globals.conf from these
+    env_file: .env
+    restart: unless-stopped
+
+  agent:
+    build: ./agent
+    # TCP only — works on Docker-for-Mac too.
+    ports:
+      - "127.0.0.1:${AUDIOSOCKET_PORT:-9000}:9000"
+    env_file: .env
+    restart: unless-stopped

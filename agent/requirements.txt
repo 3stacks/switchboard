@@ -1,0 +1,8 @@
+anthropic                 # Claude (Messages API, streaming)
+
+# STT/TTS deps depend on the adapter you enable in .env (see bridge.py):
+# faster-whisper          # local STT  (STT_PROVIDER=whisper)
+# deepgram-sdk            # streaming cloud STT, nova phonecall model (STT_PROVIDER=deepgram)
+# cartesia                # low-latency cloud TTS (TTS_PROVIDER=cartesia)
+# elevenlabs              # cloud TTS (TTS_PROVIDER=elevenlabs)
+# TTS_PROVIDER=say uses macOS `say` — no pip dep, Mac host only.

@@ -1,0 +1,13 @@
+;==============================================================
+; switchboard — dialplan globals (TEMPLATE)
+; Rendered to globals.conf by envsubst. globals.conf is gitignored — it holds
+; ALLOWED_CLID_9 (your mobile = PII).
+;==============================================================
+[globals]
+ALLOWED_CLID_9=${ALLOWED_CLID_9}
+AUDIOSOCKET_HOST=127.0.0.1
+AUDIOSOCKET_PORT=${AUDIOSOCKET_PORT}
+; AudioSocket connection id. A static id is fine for a single-call-at-a-time home
+; setup; for concurrent calls generate per-call (SHELL(uuidgen) with func_shell, or
+; derive from CHANNEL(uniqueid)).
+AS_ID=8f14e45f-ceea-467d-9d8b-1a3b9c2f7e10
