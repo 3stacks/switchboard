@@ -4,6 +4,10 @@
 ; entrypoint). DO NOT put real values here — this file is committed.
 ;==============================================================
 
+[global]
+type=global
+keep_alive_interval=30        ; CRLF keepalives to keep the NAT mapping alive
+
 [transport-udp]
 type=transport
 protocol=udp
@@ -51,6 +55,8 @@ dtmf_mode=rfc4733
 [maxotel-aor]
 type=aor
 contact=sip:sip.maxo.com.au
+qualify_frequency=30          ; OPTIONS keepalive — holds the NAT pinhole open for inbound
+qualify_timeout=5
 
 [maxotel-identify]
 type=identify

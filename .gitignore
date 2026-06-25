@@ -21,3 +21,4 @@ recordings/
 # misc
 .DS_Store
 *.log
+agent/voices/
