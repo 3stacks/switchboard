@@ -360,10 +360,24 @@ question, heard *"On it, I'll report back,"* then heard the answer — and a sec
 question in the same call resumed context. Phone → STT → agent → TTS → phone, on the
 subscription, end to end.
 
-**Open / next:** streaming Deepgram (retire the energy gate); the opencode backend's
-output parse + an OpenRouter model; optional filesystem scoping (the agent runs
-`bypassPermissions` over `~/Sites` today); and the spoken-summary prompt could lean
-more "coding assistant" than "general Q&A".
+## Roadmap
+
+- **Multi-session management** — today it's a single resume-most-recent session.
+  Add named / per-project sessions: *"work on lector"* / *"switch to switchboard"* sets
+  `cwd` to that repo and resumes (or forks) its own session id; *"list sessions"*. A
+  `{project → session_id}` store mapped onto the SDK's `resume=` (and opencode's `-s`).
+- **Keyword commands** — generalize the lone *"new session"* keyword into a small
+  command layer parsed *before* the agent: *"status"* (what's running), *"stop"/"cancel"*
+  (abort `_current_task`), *"repeat"* (replay last result), *"switch to <project>"* /
+  *"list sessions"* (ties to multi-session). DTMF digits could map to commands too —
+  the bridge already receives them.
+- **Streaming Deepgram** — replace the energy-RMS VAD with Deepgram's streaming
+  endpointing (partials + lower latency); retires the gate and most of `flush_backlog`.
+- **opencode backend** — verify the `opencode run` output parse and pick an OpenRouter
+  model (wired, not yet exercised).
+- **Filesystem scoping** — the agent runs `bypassPermissions` over `~/Sites`; consider
+  the SDK `sandbox` / `add_dirs` to bound a misfire.
+- **Spoken-summary prompt** — lean it more "coding assistant" than "general Q&A".
 
 ## Architecture (as built)
 
