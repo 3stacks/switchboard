@@ -27,6 +27,7 @@ import asyncio
 import logging
 
 import coding_agent
+import sessions
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # httpx/httpcore log full request URLs at INFO — that clutters the call log and
@@ -57,14 +58,13 @@ MAX_UTTERANCE_MS = 10000  # force endpoint if speech runs longer than this
 # callback and let two tasks resume+corrupt the same agent session. _active_writer
 # is the call currently on the line, so a finished task plays its result to whoever
 # is holding (even after hang-up + redial); otherwise it's persisted for next call.
-_agent = None
 _current_task = None
 _active_writer = None
 _write_lock = asyncio.Lock()
 _bg_tasks = set()
 
+WAKE_WORDS = ("switchboard", "switch board")   # a leading wake word => command, not an agent request
 PREROLL_BYTES = 4800   # ~300 ms lead-in kept before speech, so a muted hold can't bloat the next utterance
-NEW_SESSION_PHRASES = ("new session", "start fresh", "fresh session", "start over", "forget the session")
 RESULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "last-result.json")
 
 
@@ -301,13 +301,17 @@ async def _speak(text: str, tts) -> bool:
     return True
 
 
-async def _run_agent_task(text: str, tts) -> None:
-    """Background coding task that outlives the call: run the agent, persist the
-    result, then deliver it to whoever is on the line (else leave it for next call)."""
+async def _run_agent_task(sess, text: str, tts) -> None:
+    """Background coding task that outlives the call: run the active session's agent,
+    store the new session id, then deliver the result to whoever's on the line (else
+    leave it for the next call)."""
     global _current_task
     try:
-        reply = await _agent.run(text)
-        log.info("agent: done — %s", reply[:120])
+        agent = coding_agent.make_agent(sess["agent"])
+        reply, new_sid = await agent.run(text, sess["cwd"], sess["session_id"])
+        if new_sid:
+            sessions.set_session_id(sess["context"], new_sid)
+        log.info("agent: done [%s] — %s", sess["context"], reply[:120])
         _save_result(reply)
         if await _speak("Finished. " + reply, tts):
             _mark_delivered()
@@ -315,24 +319,96 @@ async def _run_agent_task(text: str, tts) -> None:
             log.info("agent: result saved (no live call) — will report on next call")
     except Exception:
         log.exception("agent task failed")
+        await _speak("Sorry, that run hit an error.", tts)   # never leave the caller holding silently
     finally:
         _current_task = None
 
 
+# ----------------------------- keyword commands ------------------------------
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().replace(",", " ").replace(".", " ").split())
+
+
+def _is_command(text: str) -> bool:
+    n = _normalize(text)
+    return any(n == w or n.startswith(w + " ") for w in WAKE_WORDS)
+
+
+async def _deepgram_balance() -> str:
+    """Best-effort Deepgram balance via the Management API; '' if unavailable."""
+    key = os.environ.get("DEEPGRAM_API_KEY")
+    if not key:
+        return ""
+    try:
+        import httpx
+        headers = {"Authorization": "Token " + key}
+        async with httpx.AsyncClient(timeout=8) as c:
+            pid = os.environ.get("DEEPGRAM_PROJECT_ID")
+            if not pid:
+                projects = (await c.get("https://api.deepgram.com/v1/projects", headers=headers)).json().get("projects", [])
+                if not projects:
+                    return ""
+                pid = projects[0]["project_id"]
+            bals = (await c.get(f"https://api.deepgram.com/v1/projects/{pid}/balances", headers=headers)).json().get("balances", [])
+            return f"${sum(float(b.get('amount', 0)) for b in bals):.2f}"
+    except Exception:
+        log.exception("deepgram balance lookup failed")
+        return ""
+
+
+async def _status_text() -> str:
+    sess = sessions.active_session()
+    parts = ["Switchboard operational."]
+    if sess:
+        busy = " and working" if _current_task is not None and not _current_task.done() else ""
+        parts.append(f"Active session {sess['context']} on {sess['agent']}{busy}.")
+    else:
+        parts.append("No active session.")
+    bal = await _deepgram_balance()
+    if bal:
+        parts.append(f"Deepgram balance {bal}.")
+    return " ".join(parts)
+
+
+async def _handle_command(text: str, tts) -> None:
+    n = _normalize(text)
+    for w in WAKE_WORDS:                       # strip the wake word -> "<verb> [args]"
+        if n == w or n.startswith(w + " "):
+            n = n[len(w):].strip()
+            break
+    parts = n.split()
+    verb = parts[0] if parts else ""
+    if verb == "status":
+        await _speak(await _status_text(), tts)
+    elif verb == "session" and len(parts) >= 2 and parts[1] == "start":
+        context = parts[2] if len(parts) >= 3 else "default"
+        agent = parts[3] if len(parts) >= 4 else coding_agent.DEFAULT_AGENT
+        if agent not in coding_agent.KNOWN_AGENTS:
+            await _speak(f"I don't know the agent {agent}. Try claude or opencode.", tts)
+            return
+        sessions.start_session(context, sessions.cwd_for(context), agent)
+        await _speak(f"Started a {agent} session in {context}.", tts)
+    else:
+        await _speak("Sorry, I didn't recognize that command.", tts)
+
+
 async def dispatch(text: str, tts) -> None:
-    """Route a transcribed utterance. Never blocks on the agent (it runs in bg)."""
+    """'switchboard ...' utterances are commands handled here; anything else is piped
+    to the active session's agent (in the background)."""
     global _current_task
-    low = text.lower()
-    if any(p in low for p in NEW_SESSION_PHRASES):
-        coding_agent.clear_session()
-        await _speak("Okay, starting a fresh session.", tts)
+    if _is_command(text):
+        await _handle_command(text, tts)
+        return
+    sess = sessions.active_session()
+    if sess is None:
+        await _speak("There's no active session. Say: switchboard, session start.", tts)
         return
     if _current_task is not None and not _current_task.done():
         await _speak("I'm still on the previous task. I'll let you know when it's done.", tts)
         return
-    # Claim the single task slot SYNCHRONOUSLY (no await between the check above and
-    # this assignment) so two near-simultaneous calls can't both launch a task.
-    task = asyncio.create_task(_run_agent_task(text, tts))
+    # Claim the single task slot SYNCHRONOUSLY (no await before the assignment) so two
+    # near-simultaneous calls can't both launch a task.
+    task = asyncio.create_task(_run_agent_task(sess, text, tts))
     _current_task = task
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
@@ -468,14 +544,13 @@ async def handle(reader, writer):
 
 
 async def main():
-    global _agent
     if not MIRROR_MODE:
-        _agent = coding_agent.make_agent()  # scrubs ANTHROPIC_API_KEY when an OAuth token is present
-        has_token = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
-        has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
-        log.info("agent: provider=%s cwd=%s oauth_token=%s anthropic_api_key=%s",
-                 coding_agent.AGENT_PROVIDER, coding_agent.PROJECT_DIR, has_token, has_key)
-        if not has_token and not has_key and coding_agent.AGENT_PROVIDER == "claude":
+        auth = coding_agent.ensure_subscription_auth()  # scrubs ANTHROPIC_API_KEY if an OAuth token is set
+        sess = sessions.active_session()
+        log.info("agent: default_provider=%s oauth_token=%s anthropic_api_key=%s active_session=%s",
+                 coding_agent.DEFAULT_AGENT, auth["oauth_token"], auth["anthropic_api_key"],
+                 sess["context"] if sess else None)
+        if not auth["oauth_token"] and not auth["anthropic_api_key"] and coding_agent.DEFAULT_AGENT == "claude":
             log.warning("agent: no auth — set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY")
     server = await asyncio.start_server(handle, "0.0.0.0", PORT)
     log.info("switchboard bridge listening on :%d (%s mode)", PORT, "mirror" if MIRROR_MODE else "pipeline")
