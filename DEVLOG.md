@@ -310,6 +310,61 @@ Still batch STT (the RMS gate still does endpointing). Streaming Deepgram — it
 own VAD + partials + lower latency — is the next step and would retire the energy
 gate entirely.
 
+## 8. The pivot — a coding agent you phone, agent-agnostic, on a subscription
+
+The real goal surfaced here: switchboard isn't a generic voice assistant, it's a
+voice front-end to a *coding agent* on this Mac — call in, delegate work on the real
+repos, get told when it's done. That reframed the brain from the raw Messages API to
+a proper agent SDK and fixed the design: **agent-agnostic** (so opencode/OpenRouter
+can stand in for Claude), **resume the most-recent session**, and fire-and-forget
+delivered by **muted-hold** — you stay on the one call, muted, and the answer plays
+back when the agent finishes.
+
+**Agent-agnostic layer (`agent/coding_agent.py`).** Same swappable-adapter shape as
+STT/TTS: `AGENT_PROVIDER=claude|opencode` → a `CodingAgent.run(text)` that works in a
+fixed `cwd` and returns a short *spoken* summary.
+- `claude` → Claude Agent SDK (`query()` + `resume=session_id`,
+  `permission_mode="bypassPermissions"` since no one's at a keyboard mid-call). Session
+  id persisted to `state/agent-session.json`; "new session" clears it.
+- `opencode` → `opencode run -c` (its `--continue` *is* resume-most-recent) over
+  OpenRouter. Wired; verify the output parse + set a model when an OpenRouter key is in.
+
+**Toolchain (Phase 0).** The SDK needs Python 3.10+ and Node; the box had Python 3.9
+and no Node. Installed Node + Python 3.12 + the claude & opencode CLIs and built
+`agent/.venv312` *alongside* the working `.venv`, so the live bridge kept running until
+cutover.
+
+**Subscription auth, not API credits.** An autonomous Opus agent on per-token billing
+gets expensive fast. `claude setup-token` mints a long-lived OAuth token tied to the
+Claude subscription; we set `CLAUDE_CODE_OAUTH_TOKEN` and — because a set
+`ANTHROPIC_API_KEY` *takes precedence* — scrub the API key from the process at startup.
+The startup log asserts it: `oauth_token=True anthropic_api_key=False`.
+
+**Muted-hold flow (`bridge.py`).** A turn no longer blocks the read loop on the agent
+(which can run for minutes). On an endpointed utterance: STT → speak a quick *"on it"*
+→ launch `agent.run()` as a **background task tracked module-level so it outlives the
+call**. The read loop keeps running on your muted silence (a pre-roll cap stops the
+hold from bloating the next utterance); when the task finishes it takes a write-lock
+and plays the result to whatever call is live — else persists it
+(`state/last-result.json`) to speak on your next call if you'd hung up.
+
+**The bug that mattered.** The "one task at a time" guard had to be **module-level,
+not per-call**. A per-call flag resets on a callback: delegate A → hang up (A keeps
+running) → call back → fresh handle, guard clear → delegate B → A and B both `resume=`
+the same session and corrupt it. The cross-call guard plus three other non-call
+behaviors (persist→deliver-next-call, "new session", pre-roll cap) were unit-tested on
+`.venv312` before cutover.
+
+**Live.** Cut `run-agent.sh` over to `.venv312`, restarted. First real call: asked a
+question, heard *"On it, I'll report back,"* then heard the answer — and a second
+question in the same call resumed context. Phone → STT → agent → TTS → phone, on the
+subscription, end to end.
+
+**Open / next:** streaming Deepgram (retire the energy gate); the opencode backend's
+output parse + an OpenRouter model; optional filesystem scoping (the agent runs
+`bypassPermissions` over `~/Sites` today); and the spoken-summary prompt could lean
+more "coding assistant" than "general Q&A".
+
 ## Architecture (as built)
 
 ```

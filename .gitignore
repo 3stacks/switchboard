@@ -9,8 +9,12 @@ asterisk/globals.conf
 
 # python
 agent/.venv/
+agent/.venv312/
 __pycache__/
 *.pyc
+
+# agent runtime state (session id + last result — machine-local)
+agent/state/
 
 # audio / call dumps
 *.wav

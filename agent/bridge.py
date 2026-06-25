@@ -17,11 +17,16 @@ Run modes (set in .env):
 AudioSocket framing: [kind:1][length:2 big-endian][payload]
   0x00 hangup   0x01 uuid(16B)   0x03 dtmf(1B)   0x10 audio(slin)   0xff error
 """
+from __future__ import annotations
+
 import os
+import json
 import math
 import array
 import asyncio
 import logging
+
+import coding_agent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # httpx/httpcore log full request URLs at INFO — that clutters the call log and
@@ -47,11 +52,20 @@ RMS_GATE = 1500         # int16 RMS above this = speech (line noise sits below 1
 SILENCE_HANG_MS = 600   # trailing silence that ends the turn
 MAX_UTTERANCE_MS = 10000  # force endpoint if speech runs longer than this
 
-SYSTEM_PROMPT = (
-    "You are a voice assistant reached over a phone call. Your replies are spoken "
-    "aloud, so answer in one or two short sentences. No markdown, no lists, no "
-    "emoji. If a request needs a longer background job, say so briefly and confirm."
-)
+# --- coding-agent coordination (module-level: shared across ALL calls) ---
+# One coding task runs at a time, ACROSS calls. A per-call flag would reset on a
+# callback and let two tasks resume+corrupt the same agent session. _active_writer
+# is the call currently on the line, so a finished task plays its result to whoever
+# is holding (even after hang-up + redial); otherwise it's persisted for next call.
+_agent = None
+_current_task = None
+_active_writer = None
+_write_lock = asyncio.Lock()
+_bg_tasks = set()
+
+PREROLL_BYTES = 4800   # ~300 ms lead-in kept before speech, so a muted hold can't bloat the next utterance
+NEW_SESSION_PHRASES = ("new session", "start fresh", "fresh session", "start over", "forget the session")
+RESULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "last-result.json")
 
 
 def rms(pcm: bytes) -> float:
@@ -60,6 +74,14 @@ def rms(pcm: bytes) -> float:
     a = array.array("h")
     a.frombytes(pcm[: len(pcm) // 2 * 2])
     return math.sqrt(sum(s * s for s in a) / len(a)) if a else 0.0
+
+
+def _cap_preroll(buf: bytearray, in_speech: bool) -> None:
+    """While not yet in speech, keep only ~PREROLL_BYTES of lead-in. Stops a long
+    (e.g. muted) hold from accumulating silence that would later pad the utterance
+    or trip MAX_UTTERANCE_MS; once speech starts we stop trimming and keep it all."""
+    if not in_speech and len(buf) > PREROLL_BYTES:
+        del buf[:-PREROLL_BYTES]
 
 
 def resample_8k_to_16k(pcm_8k: bytes) -> bytes:
@@ -235,32 +257,86 @@ async def _macos_say(text: str) -> bytes:
     return _extract_wav_pcm(data)
 
 
-# ----------------------------- Claude ---------------------------------------
-class ClaudeAgent:
-    """One conversation per call."""
+# ----------------------------- agent layer -----------------------------------
+# The brain is a pluggable coding agent (coding_agent.py): AGENT_PROVIDER selects
+# claude (Claude Agent SDK, subscription) or opencode (OpenRouter). A turn does NOT
+# block on it — we ack, run it in the background, and play the result to whoever is
+# on the line when it finishes (muted-hold), persisting it as a fallback.
+def _save_result(text: str) -> None:
+    os.makedirs(os.path.dirname(RESULT_FILE), exist_ok=True)
+    with open(RESULT_FILE, "w") as f:
+        json.dump({"text": text, "delivered": False}, f)
 
-    def __init__(self):
-        from anthropic import Anthropic
-        self.client = Anthropic()
-        self.history = []
 
-    async def respond(self, text: str) -> str:
-        self.history.append({"role": "user", "content": text})
+def _take_undelivered() -> str | None:
+    try:
+        with open(RESULT_FILE) as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return None if d.get("delivered") else d.get("text")
 
-        def _call():
-            with self.client.messages.stream(
-                model=CLAUDE_MODEL,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=self.history,
-                thinking={"type": "adaptive"},
-                output_config={"effort": "low"},
-            ) as stream:
-                return stream.get_final_message()
 
-        msg = await asyncio.to_thread(_call)
-        self.history.append({"role": "assistant", "content": msg.content})
-        return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+def _mark_delivered() -> None:
+    try:
+        with open(RESULT_FILE) as f:
+            d = json.load(f)
+        d["delivered"] = True
+        with open(RESULT_FILE, "w") as f:
+            json.dump(d, f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+
+async def _speak(text: str, tts) -> bool:
+    """Play text to the call currently on the line. Returns False if none is live."""
+    w = _active_writer
+    if w is None or w.is_closing():
+        return False
+    audio = await tts.synthesize(text)
+    async with _write_lock:
+        if _active_writer is not w or w.is_closing():
+            return False
+        await send_audio(w, audio)
+    return True
+
+
+async def _run_agent_task(text: str, tts) -> None:
+    """Background coding task that outlives the call: run the agent, persist the
+    result, then deliver it to whoever is on the line (else leave it for next call)."""
+    global _current_task
+    try:
+        reply = await _agent.run(text)
+        log.info("agent: done — %s", reply[:120])
+        _save_result(reply)
+        if await _speak("Finished. " + reply, tts):
+            _mark_delivered()
+        else:
+            log.info("agent: result saved (no live call) — will report on next call")
+    except Exception:
+        log.exception("agent task failed")
+    finally:
+        _current_task = None
+
+
+async def dispatch(text: str, tts) -> None:
+    """Route a transcribed utterance. Never blocks on the agent (it runs in bg)."""
+    global _current_task
+    low = text.lower()
+    if any(p in low for p in NEW_SESSION_PHRASES):
+        coding_agent.clear_session()
+        await _speak("Okay, starting a fresh session.", tts)
+        return
+    if _current_task is not None and not _current_task.done():
+        await _speak("I'm still on the previous task. I'll let you know when it's done.", tts)
+        return
+    # Claim the single task slot SYNCHRONOUSLY (no await between the check above and
+    # this assignment) so two near-simultaneous calls can't both launch a task.
+    task = asyncio.create_task(_run_agent_task(text, tts))
+    _current_task = task
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    await _speak("On it. I'll work on that and report back — you can stay on the line.", tts)
 
 
 # ----------------------------- framing ---------------------------------------
@@ -318,18 +394,15 @@ async def flush_backlog(reader: asyncio.StreamReader) -> bool:
 
 
 # ----------------------------- call handling ---------------------------------
-async def turn(pcm, stt, agent, tts, writer):
+async def turn(pcm, stt, tts):
+    """Transcribe one endpointed utterance and route it. STT is quick; the agent
+    runs in the background, so this returns fast and the read loop resumes."""
     try:
         text = await stt.transcribe(pcm)
         if not text.strip():
             return
         log.info("caller: %s", text)
-        reply = await agent.respond(text)
-        log.info("claude: %s", reply)
-        audio = await tts.synthesize(reply)
-        log.info("tts: synthesized %d bytes (%.1fs)", len(audio), len(audio)/2/8000)
-        await send_audio(writer, audio)
-        log.info("tts: sent to asterisk")
+        await dispatch(text, tts)
     except NotImplementedError as e:
         log.error("pipeline stub: %s", e)
     except Exception:
@@ -337,15 +410,22 @@ async def turn(pcm, stt, agent, tts, writer):
 
 
 async def handle(reader, writer):
+    global _active_writer
     peer = writer.get_extra_info("peername")
     mode = "mirror" if MIRROR_MODE else "pipeline"
     log.info("call connected from %s (%s mode)", peer, mode)
 
-    agent = None if MIRROR_MODE else ClaudeAgent()
     stt, tts = (None, None) if MIRROR_MODE else (STT(), TTS())
     buf, in_speech, silence_ms = bytearray(), False, 0.0
+    _active_writer = writer
 
     try:
+        # A background task may have finished while no one was on the line — report it.
+        if not MIRROR_MODE:
+            pending = _take_undelivered()
+            if pending and await _speak("Last task finished. " + pending, tts):
+                _mark_delivered()
+
         while True:
             try:
                 kind, payload = await read_frame(reader)
@@ -363,18 +443,17 @@ async def handle(reader, writer):
                     await send_audio(writer, payload)
                     continue
                 buf.extend(payload)
-                buf_ms = len(buf) / 2 / SAMPLE_RATE * 1000
                 if rms(payload) >= RMS_GATE:
                     in_speech, silence_ms = True, 0.0
                 elif in_speech:
                     silence_ms += len(payload) / 2 / SAMPLE_RATE * 1000
+                _cap_preroll(buf, in_speech)   # keep only a short lead-in until speech starts
+                buf_ms = len(buf) / 2 / SAMPLE_RATE * 1000
                 if in_speech and (silence_ms >= SILENCE_HANG_MS or buf_ms >= MAX_UTTERANCE_MS):
                         utterance, _ = bytes(buf), buf.clear()
                         in_speech, silence_ms = False, 0.0
-                        await turn(utterance, stt, agent, tts, writer)
-                        # Drop audio buffered while we were busy/speaking, so the
-                        # caller's next turn starts from live audio (not stale
-                        # backlog that would truncate it). Bail if they hung up.
+                        await turn(utterance, stt, tts)   # STT + dispatch; agent runs in background
+                        # Drop the backlog that piled up during STT + the spoken ack.
                         if await flush_backlog(reader):
                             break
                         buf.clear()
@@ -382,13 +461,22 @@ async def handle(reader, writer):
             elif kind == KIND_ERROR:
                 log.warning("AudioSocket error %s", payload.hex())
     finally:
+        if _active_writer is writer:
+            _active_writer = None
         writer.close()
         log.info("call ended %s", peer)
 
 
 async def main():
-    if not MIRROR_MODE and not os.environ.get("ANTHROPIC_API_KEY"):
-        log.warning("ANTHROPIC_API_KEY not set — pipeline mode needs it")
+    global _agent
+    if not MIRROR_MODE:
+        _agent = coding_agent.make_agent()  # scrubs ANTHROPIC_API_KEY when an OAuth token is present
+        has_token = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+        has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        log.info("agent: provider=%s cwd=%s oauth_token=%s anthropic_api_key=%s",
+                 coding_agent.AGENT_PROVIDER, coding_agent.PROJECT_DIR, has_token, has_key)
+        if not has_token and not has_key and coding_agent.AGENT_PROVIDER == "claude":
+            log.warning("agent: no auth — set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY")
     server = await asyncio.start_server(handle, "0.0.0.0", PORT)
     log.info("switchboard bridge listening on :%d (%s mode)", PORT, "mirror" if MIRROR_MODE else "pipeline")
     async with server:
