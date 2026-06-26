@@ -397,10 +397,12 @@ now treat any `ConnectionError`/`OSError` as a clean hangup.
   Add named / per-project sessions: *"work on lector"* / *"switch to switchboard"* sets
   `cwd` to that repo and resumes (or forks) its own session id; *"list sessions"*. A
   `{project → session_id}` store mapped onto the SDK's `resume=` (and opencode's `-s`).
-- **Keyword commands** ✓ — done in v1: `status`, `session start`, active-session
-  routing (see §9). Remaining verbs: *"stop"/"cancel"* (abort `_current_task`),
-  *"repeat"* (replay last result), *"switch to <project>"* / *"list sessions"* (with
-  multi-session), and DTMF→command mapping (the bridge already receives DTMF).
+- **Keyword commands** ✓ — done in v1: `status`, `session start`, `result`/`repeat`,
+  active-session routing (see §9). A held result is now *announced* on reconnect and
+  pulled on demand with `result` (it used to auto-blurt the whole thing the instant you
+  called back). Remaining verbs: *"stop"/"cancel"* (abort `_current_task`),
+  *"switch to <project>"* / *"list sessions"* (with multi-session), and DTMF→command
+  mapping (the bridge already receives DTMF).
 - **Streaming Deepgram** — replace the energy-RMS VAD with Deepgram's streaming
   endpointing (partials + lower latency); retires the gate and most of `flush_backlog`.
 - **opencode backend** — verify the `opencode run` output parse and pick an OpenRouter

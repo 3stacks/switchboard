@@ -288,6 +288,15 @@ def _mark_delivered() -> None:
         pass
 
 
+def _last_result() -> str | None:
+    """Most recent result text, delivered or not — for the `result`/`repeat` command."""
+    try:
+        with open(RESULT_FILE) as f:
+            return json.load(f).get("text")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
 async def _speak(text: str, tts) -> bool:
     """Play text to the call currently on the line. Returns False if none is live."""
     w = _active_writer
@@ -370,6 +379,8 @@ async def _status_text() -> str:
     bal = await _deepgram_balance()
     if bal:
         parts.append(f"Deepgram balance {bal}.")
+    if _take_undelivered():
+        parts.append("One result waiting — say switchboard result.")
     return " ".join(parts)
 
 
@@ -391,6 +402,12 @@ async def _handle_command(text: str, tts) -> None:
             return
         sessions.start_session(context, sessions.cwd_for(context), agent)
         await _speak(f"Started a {agent} session in {context}.", tts)
+    elif verb in ("result", "repeat"):
+        last = _last_result()
+        if not last:
+            await _speak("No result waiting.", tts)
+        elif await _speak(last, tts):
+            _mark_delivered()
     else:
         await _speak("Sorry, I didn't recognize that command.", tts)
 
@@ -499,11 +516,11 @@ async def handle(reader, writer):
     _active_writer = writer
 
     try:
-        # A background task may have finished while no one was on the line — report it.
-        if not MIRROR_MODE:
-            pending = _take_undelivered()
-            if pending and await _speak("Last task finished. " + pending, tts):
-                _mark_delivered()
+        # A background task may have finished while no one was on the line. Don't blurt
+        # the whole thing the instant they reconnect — just note it; they pull it with
+        # `switchboard result` when ready.
+        if not MIRROR_MODE and _take_undelivered():
+            await _speak("You have a finished task waiting. Say switchboard result to hear it.", tts)
 
         while True:
             try:
