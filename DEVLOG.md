@@ -410,6 +410,13 @@ now treat any `ConnectionError`/`OSError` as a clean hangup.
 - **Filesystem scoping** — the agent runs `bypassPermissions` over `~/Sites`; consider
   the SDK `sandbox` / `add_dirs` to bound a misfire.
 - **Spoken-summary prompt** — lean it more "coding assistant" than "general Q&A".
+- **SMS channel (way down the line)** — a text front-end to the same agent, *not* over
+  the SIP trunk (that's voice/RTP). MaxoTel SMS is tied to **Virtual Mobile Numbers (04)**,
+  so the current geographic DID (`6173…`) can't do it — it'd need a VMN added to the
+  account. Mechanism: MaxoTel's SMS API + per-number SMS inboxes (`api.maxo.com.au`;
+  inbound also forwards to email), ~10c/160 chars. Integration: inbound SMS → the existing
+  `dispatch()` (commands + active-session agent) → reply via the send API. SMS is naturally
+  async/turn-based, so no muted-hold needed — text in, text back when the task's done.
 
 ## Architecture (as built)
 
