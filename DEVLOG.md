@@ -391,6 +391,23 @@ drop raised an unhandled `BrokenPipeError`/`ConnectionResetError` in the read lo
 `IncompleteReadError` was caught). Fixed: the read loop, `flush_backlog`, and `_speak`
 now treat any `ConnectionError`/`OSError` as a clean hangup.
 
+## 10. Security — the DTMF passcode gate
+
+The trunk is registration-only (nothing inbound on :5060) and inbound calls are
+CLID-allowlisted — but **caller ID is spoofable**, so that alone isn't a real gate in
+front of a `bypassPermissions` coding agent. v1 adds a **DTMF passcode**: on connect the
+caller is locked until they key `SWITCHBOARD_PIN` (in `.env`, never committed). Until then
+speech is refused (*"enter your passcode"*) and the agent is unreachable; the held-result
+notice is also withheld until auth. Per-call (re-auth every call), opt-in (no PIN → no
+gate). DTMF is a global standard, so it works from any phone/country — the only dependency
+is the trunk passing the tones through (the bridge logs every `DTMF` it receives).
+Verified by driving `handle()` with scripted frames: speech-before-PIN blocked, correct
+PIN unlocks, wrong PIN stays locked.
+
+It's a second factor, not a fortress. The real **per-action** authorization is the toolgate
+layer (next, see Roadmap): route the SDK's `can_use_tool` through toolgate's per-repo
+policies and raise a *verbal* approval prompt for anything not already allowed.
+
 ## Roadmap
 
 - **Multi-session management** — today it's a single resume-most-recent session.
@@ -407,8 +424,12 @@ now treat any `ConnectionError`/`OSError` as a clean hangup.
   endpointing (partials + lower latency); retires the gate and most of `flush_backlog`.
 - **opencode backend** — verify the `opencode run` output parse and pick an OpenRouter
   model (wired, not yet exercised).
-- **Filesystem scoping** — the agent runs `bypassPermissions` over `~/Sites`; consider
-  the SDK `sandbox` / `add_dirs` to bound a misfire.
+- **Toolgate per-action permissions (next security layer)** — replace `bypassPermissions`
+  with the SDK's `can_use_tool` routed through toolgate's per-repo policies; on a `next`
+  verdict (no policy decides) raise a *verbal* approval prompt over the call (caller says
+  yes/no). Needs both toolgate configs committed per repo + toolgate installed on the box,
+  and the committed configs reviewed for the *phone* threat model (local allows are likely
+  too loose). Subsumes the earlier "filesystem scoping" idea.
 - **Spoken-summary prompt** — lean it more "coding assistant" than "general Q&A".
 - **SMS channel (way down the line)** — a text front-end to the same agent, *not* over
   the SIP trunk (that's voice/RTP). MaxoTel SMS is tied to **Virtual Mobile Numbers (04)**,

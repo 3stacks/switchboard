@@ -66,6 +66,7 @@ _bg_tasks = set()
 WAKE_WORDS = ("switchboard", "switch board")   # a leading wake word => command, not an agent request
 PREROLL_BYTES = 4800   # ~300 ms lead-in kept before speech, so a muted hold can't bloat the next utterance
 RESULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "last-result.json")
+PIN = os.environ.get("SWITCHBOARD_PIN", "").strip()   # DTMF passcode gate; empty = no gate
 
 
 def rms(pcm: bytes) -> float:
@@ -297,6 +298,12 @@ def _last_result() -> str | None:
         return None
 
 
+async def _announce_pending(tts) -> None:
+    """Note a held result (caller pulls the content with `switchboard result`)."""
+    if _take_undelivered():
+        await _speak("You have a finished task waiting. Say switchboard result to hear it.", tts)
+
+
 async def _speak(text: str, tts) -> bool:
     """Play text to the call currently on the line. Returns False if none is live."""
     w = _active_writer
@@ -513,14 +520,15 @@ async def handle(reader, writer):
 
     stt, tts = (None, None) if MIRROR_MODE else (STT(), TTS())
     buf, in_speech, silence_ms = bytearray(), False, 0.0
+    authed, pin_buf = (not PIN), ""   # locked until the DTMF passcode is keyed (open if no PIN set)
     _active_writer = writer
 
     try:
-        # A background task may have finished while no one was on the line. Don't blurt
-        # the whole thing the instant they reconnect — just note it; they pull it with
-        # `switchboard result` when ready.
-        if not MIRROR_MODE and _take_undelivered():
-            await _speak("You have a finished task waiting. Say switchboard result to hear it.", tts)
+        if not MIRROR_MODE:
+            if authed:
+                await _announce_pending(tts)   # no gate — note any held result on connect
+            else:
+                await _speak("Please enter your passcode on the keypad to begin.", tts)
 
         while True:
             try:
@@ -533,7 +541,15 @@ async def handle(reader, writer):
             elif kind == KIND_UUID:
                 log.info("call id %s", payload.hex())
             elif kind == KIND_DTMF:
-                log.info("DTMF %s", payload.decode(errors="replace"))
+                digit = payload.decode(errors="replace")
+                log.info("DTMF %s", digit)
+                if not authed and PIN:
+                    pin_buf = (pin_buf + digit)[-32:]      # accumulate; match when it ends with the PIN
+                    if pin_buf.endswith(PIN):
+                        authed, pin_buf = True, ""
+                        log.info("caller authenticated via passcode")
+                        await _speak("Accepted.", tts)
+                        await _announce_pending(tts)
             elif kind == KIND_AUDIO:
                 if MIRROR_MODE:
                     await send_audio(writer, payload)
@@ -548,10 +564,12 @@ async def handle(reader, writer):
                 if in_speech and (silence_ms >= SILENCE_HANG_MS or buf_ms >= MAX_UTTERANCE_MS):
                         utterance, _ = bytes(buf), buf.clear()
                         in_speech, silence_ms = False, 0.0
-                        await turn(utterance, stt, tts)   # STT + dispatch; agent runs in background
-                        # Drop the backlog that piled up during STT + the spoken ack.
-                        if await flush_backlog(reader):
-                            break
+                        if not authed:
+                            await _speak("Please enter your passcode on the keypad first.", tts)
+                        else:
+                            await turn(utterance, stt, tts)   # STT + dispatch; agent runs in background
+                            if await flush_backlog(reader):   # drop backlog from STT + the spoken ack
+                                break
                         buf.clear()
                         in_speech, silence_ms = False, 0.0
             elif kind == KIND_ERROR:
@@ -572,6 +590,7 @@ async def main():
                  sess["context"] if sess else None)
         if not auth["oauth_token"] and not auth["anthropic_api_key"] and coding_agent.DEFAULT_AGENT == "claude":
             log.warning("agent: no auth — set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY")
+        log.info("auth: DTMF passcode gate %s", "ON" if PIN else "OFF (set SWITCHBOARD_PIN to enable)")
     server = await asyncio.start_server(handle, "0.0.0.0", PORT)
     log.info("switchboard bridge listening on :%d (%s mode)", PORT, "mirror" if MIRROR_MODE else "pipeline")
     async with server:
