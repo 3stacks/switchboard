@@ -24,7 +24,8 @@ DB_PATH = os.environ.get(
 # Known contexts -> working dir. Unknown context names fall back to ~/Sites/<context>.
 CONTEXTS = {
     "default": os.path.expanduser("~/Sites"),
-    "personal": os.path.expanduser("~/personal"),
+    "personal": os.path.expanduser("~/personal"),       # 3stacks/personal-work
+    "ko": os.path.expanduser("~/ko-work"),              # 3stacks/ko-work
     "switchboard": os.path.expanduser("~/Sites/switchboard"),
 }
 
