@@ -360,17 +360,47 @@ question, heard *"On it, I'll report back,"* then heard the answer — and a sec
 question in the same call resumed context. Phone → STT → agent → TTS → phone, on the
 subscription, end to end.
 
+## 9. Keyword commands — a wake-word grammar in front of the agent
+
+Rather than pipe every utterance to the LLM, the bridge now parses a small command
+grammar first. An utterance starting with the wake word **"switchboard"** is a command
+handled in `dispatch()` *before* any agent runs; anything else is piped to the **active
+session**.
+
+- `switchboard status` → spoken health: operational + active session + Deepgram balance
+  (Management API; set `DEEPGRAM_PROJECT_ID` to pin the project). The Claude
+  subscription-limit % stays out until there's a real source — no fake numbers.
+- `switchboard session start [<context>] [<agent>]` → activates a session: a context maps
+  to a cwd (`personal`→`~/personal`, …), the agent picks the backend (claude | opencode,
+  validated). v1 no-args → `default` / `~/Sites` / claude.
+- Bare speech → routed to the active session's agent (cwd + resume from the store); no
+  active session → a prompt to start one.
+
+State lives in **SQLite** (`state/switchboard.db`, opened via `contextlib.closing` so a
+long-lived bridge doesn't leak connections) — one active session for v1, schema ready
+for multi-session. `coding_agent.run(text, cwd, session_id)` became per-session; the
+store owns the session id.
+
+Verified offline (store, status, session-start, routing, unknown-agent reject,
+agent-error-spoken, no-session), then **proven live in the most fitting way possible:
+the phone agent committed this very feature** — *"session start"*, then *"commit the
+keyword-command work"* → it branched and committed `agent/{bridge,coding_agent,
+sessions}.py` itself, over the phone. The call dropped on the way out and the muted-hold
+**fallback persisted the result for the next call** — which surfaced a bug: an abrupt
+drop raised an unhandled `BrokenPipeError`/`ConnectionResetError` in the read loop (only
+`IncompleteReadError` was caught). Fixed: the read loop, `flush_backlog`, and `_speak`
+now treat any `ConnectionError`/`OSError` as a clean hangup.
+
 ## Roadmap
 
 - **Multi-session management** — today it's a single resume-most-recent session.
   Add named / per-project sessions: *"work on lector"* / *"switch to switchboard"* sets
   `cwd` to that repo and resumes (or forks) its own session id; *"list sessions"*. A
   `{project → session_id}` store mapped onto the SDK's `resume=` (and opencode's `-s`).
-- **Keyword commands** — generalize the lone *"new session"* keyword into a small
-  command layer parsed *before* the agent: *"status"* (what's running), *"stop"/"cancel"*
-  (abort `_current_task`), *"repeat"* (replay last result), *"switch to <project>"* /
-  *"list sessions"* (ties to multi-session). DTMF digits could map to commands too —
-  the bridge already receives them.
+- **Keyword commands** ✓ — done in v1: `status`, `session start`, active-session
+  routing (see §9). Remaining verbs: *"stop"/"cancel"* (abort `_current_task`),
+  *"repeat"* (replay last result), *"switch to <project>"* / *"list sessions"* (with
+  multi-session), and DTMF→command mapping (the bridge already receives DTMF).
 - **Streaming Deepgram** — replace the energy-RMS VAD with Deepgram's streaming
   endpointing (partials + lower latency); retires the gate and most of `flush_backlog`.
 - **opencode backend** — verify the `opencode run` output parse and pick an OpenRouter

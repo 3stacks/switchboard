@@ -297,7 +297,10 @@ async def _speak(text: str, tts) -> bool:
     async with _write_lock:
         if _active_writer is not w or w.is_closing():
             return False
-        await send_audio(w, audio)
+        try:
+            await send_audio(w, audio)
+        except (ConnectionError, OSError):
+            return False   # call dropped mid-playback — caller persists the result instead
     return True
 
 
@@ -457,8 +460,8 @@ async def flush_backlog(reader: asyncio.StreamReader) -> bool:
         t = loop.time()
         try:
             kind, _ = await read_frame(reader)
-        except asyncio.IncompleteReadError:
-            return True
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            return True   # call dropped (incl. CGNAT reset / broken pipe)
         if kind == KIND_HANGUP:
             return True
         if loop.time() - t > 0.015:  # arrived in ~real time -> caught up to live
@@ -505,7 +508,7 @@ async def handle(reader, writer):
         while True:
             try:
                 kind, payload = await read_frame(reader)
-            except asyncio.IncompleteReadError:
+            except (asyncio.IncompleteReadError, ConnectionError, OSError):
                 break
 
             if kind == KIND_HANGUP:
